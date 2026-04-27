@@ -1,280 +1,240 @@
 // Espera o conteúdo da página ser totalmente carregado para executar o script
 window.addEventListener('DOMContentLoaded', () => {
-    // Referencias dos elementos
     const bpmDisplay = document.getElementById('bpm-display');
     const tapArea = document.body;
     const resetBtn = document.getElementById('reset-btn');
 
-    // Configurações
-    const MAX_HISTORY = 8;
-    const MIN_INTERVAL = 150; // Intervalo mínimo entre taps (ms) - evita taps muito rápidos
-    const MAX_INTERVAL = 3000; // Intervalo máximo para considerar válido (ms)
-    const RESET_TIMEOUT = 5000; // Tempo para reset automático (ms)
-    
-    let currentBPM = 0;
-    let tapHistory = [];
+    // --- Configurações ---
+    const MAX_HISTORY = 10;            // Mais taps = regressão mais precisa
+    const MIN_INTERVAL = 200;          // ms entre taps (300 BPM cap)
+    const MAX_INTERVAL = 3000;         // Acima disso, intervalo descartado
+    const RESET_TIMEOUT = 5000;        // Reset automático após pausa
+    const PROCESS_LOCKOUT = 120;       // Cooldown defensivo contra disparos concorrentes
+    const GHOST_CLICK_GUARD = 600;     // Bloqueia mouse após touchend (clique-fantasma)
+    const BPM_HISTORY_SIZE = 5;
+    const BPM_DOMINANCE_RATIO = 0.6;
+    const MIN_BPM = 30;
+    const MAX_BPM = 300;
+
+    let tapHistory = [];               // timestamps de performance.now()
     let lastTapTime = 0;
     let bpmLock = false;
     let bpmLockValue = null;
     let bpmHistory = [];
-    const BPM_HISTORY_SIZE = 5;
-    const BPM_DOMINANCE_RATIO = 0.6; // Reduzido para 60%
-    
-    let isProcessing = false; // Flag para evitar processamento múltiplo
+    let isProcessing = false;
+    let flashing = false;
 
-    // Função para brilho do fundo
+    // Estado de toque para evitar misclicks no mobile
+    let activeTouchId = null;
+    let touchActive = false;
+    let lastTouchEnd = 0;
+
+    // Remove o atraso de 300ms e desabilita double-tap-zoom no mobile
+    tapArea.style.touchAction = 'manipulation';
+
     function flashBackground() {
-        if (tapArea.style.transition) return; // Evita múltiplos flashes
-        
-        tapArea.style.transition = 'background-color 0.1s ease';
+        if (flashing) return;
+        flashing = true;
+        tapArea.style.transition = 'background-color 0.08s ease';
         tapArea.style.backgroundColor = '#fff';
-        
         setTimeout(() => {
             tapArea.style.backgroundColor = '';
             setTimeout(() => {
                 tapArea.style.transition = '';
+                flashing = false;
             }, 100);
         }, 80);
     }
 
-    // Método para filtrar outliers (melhorado)
-    function filterOutliers(intervals) {
-        if (intervals.length < 3) return intervals;
-        
-        // Remove intervalos muito pequenos ou muito grandes
-        let validIntervals = intervals.filter(interval => 
-            interval >= MIN_INTERVAL && interval <= MAX_INTERVAL
-        );
-        
-        if (validIntervals.length === 0) return [];
-        
-        // Aplicar filtro IQR apenas se temos dados suficientes
-        if (validIntervals.length >= 5) {
-            let sorted = [...validIntervals].sort((a, b) => a - b);
-            let q1 = sorted[Math.floor(sorted.length * 0.25)];
-            let q3 = sorted[Math.floor(sorted.length * 0.75)];
-            let iqr = q3 - q1;
-            
-            if (iqr > 0) {
-                let lowerBound = q1 - 1.5 * iqr;
-                let upperBound = q3 + 1.5 * iqr;
-                return validIntervals.filter(interval => 
-                    interval >= lowerBound && interval <= upperBound
-                );
-            }
-        }
-        
-        return validIntervals;
-    }
-
-    // Método para resetar o contador
     function reset() {
         tapHistory = [];
-        currentBPM = 0;
-        bpmDisplay.textContent = '0';
+        bpmHistory = [];
         lastTapTime = 0;
         bpmLock = false;
         bpmLockValue = null;
-        bpmHistory = [];
         isProcessing = false;
+        bpmDisplay.textContent = '0';
         bpmDisplay.style.color = '';
-        console.log('Detector resetado.');
     }
 
-    // Método para calcular a moda mais robusta
+    function median(arr) {
+        if (arr.length === 0) return 0;
+        const sorted = [...arr].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
     function calculateMode(values) {
         if (values.length === 0) return null;
-        
-        let frequency = {};
+        const frequency = {};
         let maxCount = 0;
         let mode = values[0];
-        
-        values.forEach(value => {
-            frequency[value] = (frequency[value] || 0) + 1;
-            if (frequency[value] > maxCount) {
-                maxCount = frequency[value];
-                mode = value;
+        for (const v of values) {
+            frequency[v] = (frequency[v] || 0) + 1;
+            if (frequency[v] > maxCount) {
+                maxCount = frequency[v];
+                mode = v;
             }
-        });
-        
-        return {
-            value: mode,
-            count: maxCount,
-            dominance: maxCount / values.length
-        };
+        }
+        return { value: mode, count: maxCount, dominance: maxCount / values.length };
     }
 
-    // Método principal para processar o tap (melhorado)
-    function processTap() {
-        if (isProcessing) return; // Evita processamento múltiplo
-        
-        let now = Date.now();
-        
-        // Debouncing - evita taps muito rápidos
-        if (lastTapTime && now - lastTapTime < MIN_INTERVAL) {
-            return;
-        }
-        
-        // Se o intervalo for muito grande, reseta o histórico
-        if (lastTapTime && now - lastTapTime > RESET_TIMEOUT) {
-            reset();
-            now = Date.now(); // Atualiza o tempo após reset
-        }
-        
-        isProcessing = true;
-        lastTapTime = now;
-        tapHistory.push(now);
-        
-        // Mantém apenas os últimos MAX_HISTORY taps
-        if (tapHistory.length > MAX_HISTORY) {
-            tapHistory.shift();
-        }
-        
-        if (tapHistory.length >= 2) {
-            calculateBPM();
-        }
-        
-        flashBackground();
-        
-        // Libera o processamento após um pequeno delay
-        setTimeout(() => {
-            isProcessing = false;
-        }, 50);
-    }
-
-    // Método para calcular BPM (melhorado)
+    // BPM via regressão linear de (índice da batida, tempo).
+    // Usar todos os taps como mínimos quadrados é mais preciso que a média de
+    // intervalos, que se reduz a (último - primeiro)/n e descarta taps intermediários.
     function calculateBPM() {
         if (tapHistory.length < 2) return;
-        
-        // Calcula intervalos entre taps
-        let intervals = [];
+
+        const intervals = [];
         for (let i = 1; i < tapHistory.length; i++) {
             intervals.push(tapHistory[i] - tapHistory[i - 1]);
         }
-        
-        // Filtra outliers
-        let filteredIntervals = filterOutliers(intervals);
-        
-        if (filteredIntervals.length === 0) {
-            return; // Não atualiza se não há intervalos válidos
+
+        const med = median(intervals);
+        if (med < MIN_INTERVAL || med > MAX_INTERVAL) return;
+
+        // Mapeia cada tap a um índice de batida. Descarta double-taps acidentais
+        // e contabiliza batidas perdidas para que a regressão fique consistente.
+        const points = [{ idx: 0, t: tapHistory[0] }];
+        let prevIdx = 0;
+        let prevTime = tapHistory[0];
+
+        for (let i = 1; i < tapHistory.length; i++) {
+            const dt = tapHistory[i] - prevTime;
+            if (dt < med * 0.5) continue; // double-tap acidental: ignora
+            const beatsElapsed = Math.max(1, Math.round(dt / med));
+            prevIdx += beatsElapsed;
+            prevTime = tapHistory[i];
+            points.push({ idx: prevIdx, t: tapHistory[i] });
         }
-        
-        // Calcula média dos intervalos filtrados
-        let totalInterval = filteredIntervals.reduce((sum, interval) => sum + interval, 0);
-        let averageInterval = totalInterval / filteredIntervals.length;
-        
-        // Converte para BPM e limita valores razoáveis
-        let newBPM = Math.round(60000 / averageInterval);
-        newBPM = Math.max(30, Math.min(300, newBPM)); // Limita entre 30 e 300 BPM
-        
-        // Adiciona ao histórico de BPM
+
+        if (points.length < 2) return;
+
+        // Regressão linear: t = a + b*idx (b = ms por batida)
+        const n = points.length;
+        let sumI = 0, sumT = 0;
+        for (const p of points) { sumI += p.idx; sumT += p.t; }
+        const meanI = sumI / n;
+        const meanT = sumT / n;
+        let num = 0, den = 0;
+        for (const p of points) {
+            const di = p.idx - meanI;
+            num += di * (p.t - meanT);
+            den += di * di;
+        }
+        if (den <= 0) return;
+        const slope = num / den;
+        if (slope < MIN_INTERVAL || slope > MAX_INTERVAL) return;
+
+        let newBPM = Math.round(60000 / slope);
+        newBPM = Math.max(MIN_BPM, Math.min(MAX_BPM, newBPM));
+
         bpmHistory.push(newBPM);
-        if (bpmHistory.length > BPM_HISTORY_SIZE) {
-            bpmHistory.shift();
-        }
-        
-        // Calcula moda
-        let modeResult = calculateMode(bpmHistory);
+        if (bpmHistory.length > BPM_HISTORY_SIZE) bpmHistory.shift();
+
+        const modeResult = calculateMode(bpmHistory);
         if (!modeResult) return;
-        
-        let { value: mode, dominance } = modeResult;
-        
-        // Sistema de travamento melhorado
+        const { value: mode, dominance } = modeResult;
+
         if (bpmLock) {
-            // Se travado, verifica se deve destravar
-            let currentModeResult = calculateMode(bpmHistory.slice(-5)); // Últimos 5 valores
-            if (currentModeResult && currentModeResult.value !== bpmLockValue && 
-                currentModeResult.dominance > 0.6) {
-                // Destrava se nova moda for consistente
+            const recent = calculateMode(bpmHistory.slice(-Math.min(5, BPM_HISTORY_SIZE)));
+            if (recent && recent.value !== bpmLockValue && recent.dominance > 0.6) {
                 bpmLock = false;
                 bpmLockValue = null;
                 bpmDisplay.style.color = '';
-                console.log('BPM destravado para:', currentModeResult.value);
             }
         }
-        
-        // Atualiza display
+
         if (bpmLock) {
             bpmDisplay.textContent = bpmLockValue.toString();
         } else {
-            // Trava se houver dominância suficiente
-            if (dominance >= BPM_DOMINANCE_RATIO && bpmHistory.length >= Math.min(6, BPM_HISTORY_SIZE)) {
+            if (dominance >= BPM_DOMINANCE_RATIO &&
+                bpmHistory.length >= Math.min(4, BPM_HISTORY_SIZE)) {
                 bpmLock = true;
                 bpmLockValue = mode;
-                bpmDisplay.style.color = '#FFD700'; // Dourado em vez de amarelo
-                console.log('BPM travado em:', mode);
+                bpmDisplay.style.color = '#FFD700';
             } else {
                 bpmDisplay.style.color = '';
             }
             bpmDisplay.textContent = mode.toString();
         }
-        
-        currentBPM = mode;
     }
 
-    // Event Listeners melhorados
-    let touchStarted = false;
-    let mousePressed = false;
+    function processTap() {
+        if (isProcessing) return;
+        const now = performance.now();
 
-    // Mouse events
+        if (lastTapTime && now - lastTapTime < MIN_INTERVAL) return;
+        if (lastTapTime && now - lastTapTime > RESET_TIMEOUT) reset();
+
+        isProcessing = true;
+        lastTapTime = now;
+        tapHistory.push(now);
+        if (tapHistory.length > MAX_HISTORY) tapHistory.shift();
+
+        if (tapHistory.length >= 2) calculateBPM();
+        flashBackground();
+
+        setTimeout(() => { isProcessing = false; }, PROCESS_LOCKOUT);
+    }
+
+    // --- Event listeners ---
+
+    // Mouse: bloqueia clique-fantasma logo após interação por toque
     tapArea.addEventListener('mousedown', (event) => {
         if (event.target === resetBtn) return;
-        if (touchStarted) return; // Evita conflito com touch
-        
-        mousePressed = true;
+        if (touchActive) return;
+        if (performance.now() - lastTouchEnd < GHOST_CLICK_GUARD) return;
         processTap();
     });
 
-    tapArea.addEventListener('mouseup', () => {
-        mousePressed = false;
-    });
-
-    // Touch events (com melhor handling)
+    // Touch: rastreia o primeiro dedo via identifier para ignorar toques extras
+    // (palma, segundo dedo) sem bloquear o próximo tap legítimo.
     tapArea.addEventListener('touchstart', (event) => {
         if (event.target === resetBtn) return;
-        
-        event.preventDefault(); // Previne scroll e outros comportamentos
-        touchStarted = true;
-        
-        // Processa apenas o primeiro toque
-        if (event.touches.length === 1) {
-            processTap();
-        }
-    }, { passive: false });
-
-    tapArea.addEventListener('touchend', (event) => {
         event.preventDefault();
-        setTimeout(() => {
-            touchStarted = false;
-        }, 100);
+        if (activeTouchId !== null) return;
+        const t = event.changedTouches[0];
+        activeTouchId = t.identifier;
+        touchActive = true;
+        processTap();
     }, { passive: false });
 
-    // Keyboard events
+    function endTouch(event) {
+        if (activeTouchId === null) return;
+        for (const t of event.changedTouches) {
+            if (t.identifier === activeTouchId) {
+                activeTouchId = null;
+                touchActive = false;
+                lastTouchEnd = performance.now();
+                return;
+            }
+        }
+    }
+
+    tapArea.addEventListener('touchend', endTouch);
+    tapArea.addEventListener('touchcancel', endTouch);
+
     document.addEventListener('keydown', (event) => {
-        // Evita repetição automática de teclas
         if (event.repeat) return;
+        const tag = event.target && event.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
         processTap();
     });
 
-    // Reset button
     resetBtn.addEventListener('click', (event) => {
         event.stopPropagation();
         reset();
         flashBackground();
     });
 
-    // Previne seleção de texto e outros comportamentos indesejados
     tapArea.addEventListener('selectstart', (e) => e.preventDefault());
     tapArea.addEventListener('dragstart', (e) => e.preventDefault());
-    
-    // Reset automático quando a página perde foco
+    tapArea.addEventListener('contextmenu', (e) => e.preventDefault());
+
     window.addEventListener('blur', () => {
         setTimeout(() => {
-            if (tapHistory.length > 0) {
-                reset();
-            }
+            if (tapHistory.length > 0) reset();
         }, 1000);
     });
-
-    console.log('BPM Detector inicializado com sucesso!');
 });
